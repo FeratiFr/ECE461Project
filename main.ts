@@ -3,9 +3,36 @@ import * as path from 'path';
 import axios from 'axios';
 import { calculateBusFactor, netScore, responsiveMaintainer, licenseCheck, calculateCorrectnessScore, RampUp } from './algo';
 import { getInfo, processUrls } from './parser';
-import simpleGit, { SimpleGit, LogResult, DefaultLogFields } from 'simple-git';
-import { endianness } from 'os';
+import * as dotenv from 'dotenv'
+import { json } from 'node:stream/consumers';
 import { exit } from 'process';
+const winston = require('winston'); // Import Winston using CommonJS syntax
+winston.remove(winston.transports.Console); // Remove the default console transport
+dotenv.config();
+
+// Check if GITHUB_TOKEN is set and provide a default value if not
+if (!process.env.GITHUB_TOKEN) {
+  process.exit(1);
+}
+
+if (!process.env.LOG_FILE) {
+  process.exit(1);
+}
+
+const logLevel = parseInt(process.env.LOG_LEVEL);
+
+
+// Configure Winston to use a log file and set log level based on environment variables
+winston.configure({
+  level: logLevel === 0 ? 'error' : logLevel === 1 ? 'info' : 'debug', // Default to 'error' if LOG_LEVEL is not set
+  format: winston.format.json(),
+  transports: [
+    new winston.transports.File({ filename: process.env.LOG_FILE }), // Log to a file
+  ],
+});
+
+const githubToken = process.env.GITHUB_TOKEN;
+
 
 // Determine the subdirectory name for storing cloned repositories
 const localRepositorySubdirectory = 'cloned_repositories';
@@ -33,16 +60,30 @@ function createOrClearDirectory(directoryPath: string) {
   }
 }
 
-
-
-
-
-
-
 // Function to fetch the number of weekly commits and other required data
-async function fetchDataAndCalculateScore(repoUrl: string) {
+async function fetchDataAndCalculateScore(inputUrl: string) {
+  let repoUrl = inputUrl;
+
+  // Check if the input URL is an npm package link and try to get the corresponding GitHub repo
+  if (inputUrl.startsWith('https://www.npmjs.com/package/')) {
+    const packageName = extractPackageNameFromNpmLink(inputUrl);
+
+    if (packageName) {
+      const githubRepo = await getGitHubRepoFromNpm(packageName);
+
+      if (githubRepo) {
+        repoUrl = githubRepo;
+      } else {
+        winston.error(`Unable to find GitHub repository for npm package "${packageName}"`);
+        process.exit(1); // Exit with a failure status code (1) on error
+      }
+    } else {
+      winston.error(`Invalid npm package link: "${inputUrl}"`);
+      process.exit(1); // Exit with a failure status code (1) on error
+    }
+  }
   // Define your GitHub Personal Access Token
-  const githubToken = ' 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 '; // Replace with your GitHub token
+  const githubToken = process.env.GITHUB_TOKEN; // Replace with your GitHub token
 
   // Define headers with the authorization token
   const headers = {
@@ -53,48 +94,60 @@ async function fetchDataAndCalculateScore(repoUrl: string) {
 
   // Create or clear the local repository directory
   createOrClearDirectory(localRepositoryDirectory);
+  winston.info(`Processing URL: ${repoUrl}`);
 
   const { owner, repoName } = parseGitHubUrl(repoUrl);
-
-// Read GraphQL queries from queries.txt
-  const queries = `
-    query {
-      repository(owner:"${owner}",name:"${repoName}"){
-        defaultBranchRef{
-          target{
-            ... on Commit{
-              history(first:1){
-                edges{
-                  node{
-                    committedDate
-                  }
+  // Read GraphQL queries from queries.txt
+  const queries =
+    `query {
+    repository(owner: "${owner}", name: "${repoName}") {
+      defaultBranchRef {
+        target {
+          ... on Commit {
+            history(first: 1) {
+              edges {
+                node {
+                  committedDate
                 }
               }
             }
           }
         }
-        object(expression: "HEAD:README.md") {
-          ... on Blob {
-            text
-          }
+      }
+      ObjectReadme: object(expression: "HEAD:Readme.md") {
+        ... on Blob {
+          text
+        }
+      }
+      ObjectREADME: object(expression: "HEAD:README.md") {
+        ... on Blob {
+          text
         }
       }
     }
-  `;
+  }`;
+
   try {
     const response = await axios.post(
       graphqlEndpoint,
       { query: queries },
       { headers }
     );
-
+    if (response.data.errors) {
+      // Log GraphQL query errors
+      winston.error(`GraphQL query errors: ${JSON.stringify(response.data.errors)}`);
+      process.exit(1); // Exit with a failure status code (1) on error
+    }
     const data = response.data.data;
+    winston.info(data);
+    if (!data || !data.repository || !data.repository.defaultBranchRef || !data.repository.defaultBranchRef.target || !data.repository.defaultBranchRef.target.history || !data.repository.defaultBranchRef.target.history.edges || !data.repository.defaultBranchRef.target.history.edges[0] || !data.repository.defaultBranchRef.target.history.edges[0].node || !data.repository.defaultBranchRef.target.history.edges[0].node.committedDate) {
+      winston.error(`Error: GraphQL response does not contain the expected data for URL ${repoUrl}`);
+      process.exit(1); // Exit with a failure status code (1) on error
+    }
 
     // Extract the necessary data from the GraphQL response
     const lastCommitDate = new Date(data.repository.defaultBranchRef.target.history.edges[0].node.committedDate);
-    console.log(lastCommitDate);
-    const readmeText = data.repository.object.text;
-
+    const readmeText = data.repository.ObjectReadme ? data.repository.ObjectReadme.text : (data.repository.ObjectREADME ? data.repository.ObjectREADME.text : '');
     // Calculate the date one week ago from the current date
     const oneWeekAgo = new Date();
     oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
@@ -128,6 +181,13 @@ async function fetchDataAndCalculateScore(repoUrl: string) {
     );
 
     const licenseCheckResult = licenseCheck(readmeText);
+    
+    winston.debug(`Weekly Commit Count: ${weeklyCommitCount}`);
+    winston.debug(`Ramp Up Score: ${rampUpResult}`);
+    winston.debug(`Correctness Score: ${correctnessScore}`);
+    winston.debug(`Bus Factor Score: ${busFactorResult}`);
+    winston.debug(`Responsive Maintainer Score: ${responsiveMaintainerResult}`);
+    winston.debug(`License Score: ${licenseCheckResult}`);
 
     // Calculate the net score using your netScore function
     const netScoreResult = netScore(
@@ -137,42 +197,86 @@ async function fetchDataAndCalculateScore(repoUrl: string) {
       correctnessScore, // Include the correctness score
       rampUpResult // Use the retrieved weeklyCommits value
     );
+    winston.info(`NET_SCORE: ${netScoreResult}`);
 
-    // Print the results or perform further processing
-    console.log('Ramp Up', rampUpResult);
-    console.log('Correctness Score', correctnessScore);
-    console.log('Bus Factor:', busFactorResult);
-    console.log('Responsive Maintainer:', responsiveMaintainerResult);
-    console.log('License Check:', licenseCheckResult);
-    console.log('Net Score:', netScoreResult);
+    // Return the result for NDJSON formatting
+    const output = {
+      URL: repoUrl,
+      NET_SCORE: parseFloat(netScoreResult.toFixed(5)), 
+      RAMP_UP_SCORE: parseFloat(rampUpResult.toFixed(5)),
+      CORRECTNESS_SCORE: parseFloat(correctnessScore.toFixed(5)),
+      BUS_FACTOR_SCORE: parseFloat(busFactorResult.toFixed(5)),
+      RESPONSIVE_MAINTAINER_SCORE: parseFloat(responsiveMaintainerResult.toFixed(5)),
+      LICENSE_SCORE: parseFloat(licenseCheckResult.toFixed(5)),
+    };
+    
+    // Serialize the output to JSON
+    const jsonOutput = JSON.stringify(output);
+    
+    // Log the JSON output
+    console.log(jsonOutput);
 
   } catch (error) {
-    console.error('Error fetching data or calculating score:', error);
+    winston.error(`Error processing URL ${repoUrl}: ${error}`);
+    process.exit(1); // Exit with a failure status code (1) on error
   }
 }
 
-async function processAndCalculateScoresForUrls(filePath: string) {
+async function processAndCalculateScoresForUrls(filePath: string, outputStream: NodeJS.WritableStream) {
+  
   try {
     const urls = await processUrls(filePath);
+
+    // Process URLs sequentially using async/await
     for (const repoUrl of urls) {
-      console.log(repoUrl);
-      await fetchDataAndCalculateScore(repoUrl);
+      const result = await fetchDataAndCalculateScore(repoUrl);
+
+      // Format the result as NDJSON and write it to the output stream
+      outputStream.write(JSON.stringify(result) + '\n');
     }
+
+    // All URLs processed successfully, exit with a success status code (0)
+    process.exit(0);
   } catch (error) {
     console.error('Error processing URLs or calculating scores:', error);
+    process.exit(1); // Exit with a failure status code (1) on error
   }
 }
+
 const filePath = process.argv[2];
-  if (!filePath) {
-      console.error("No file path provided.");
-      process.exit(1);
+if (!filePath) {
+  process.exit(1); // Exit with a failure status code (1) when no file path is provided
+}
+
+// Create a writable stream for NDJSON output
+const outputStream = fs.createWriteStream('output.ndjson');
+
+// Write the NDJSON header
+outputStream.write('[');
+
+// Process URLs and write NDJSON output
+processAndCalculateScoresForUrls(filePath, outputStream);
+
+// Handle the end of NDJSON data and close the output stream
+outputStream.on('finish', () => {
+  // Close the NDJSON array
+  fs.appendFileSync('output.ndjson', ']');
+  process.exit(0);
+});
+
+// Define a function to parse GitHub repository URL
+function parseGitHubUrl(url) {
+  const githubRegex = /github\.com\/([^/]+)\/([^/]+)/;
+  const match = url.match(githubRegex);
+
+  if (match && match.length === 3) {
+    const owner = match[1];
+    const repoName = match[2];
+    return { owner, repoName };
+  } else {
+    return null;
   }
-processAndCalculateScoresForUrls(filePath);
-// Call the fetchDataAndCalculateScore function to initiate the integration
-// Call the fetchDataAndCalculateScore function to initiate the integration
-
-// fetchDataAndCalculateScore();
-
+}
 
 // Define a function to fetch and process issues data from the repository
 async function fetchAndProcessIssues(repositoryUrl: string) {
@@ -193,21 +297,38 @@ async function fetchAndProcessIssues(repositoryUrl: string) {
 
     return issues;
   } catch (error) {
-    console.error('Error fetching or processing issues:', error);
     return []; // Return an empty array in case of an error
   }
 }
 
-function parseGitHubUrl(url) {
-  const githubRegex = /github\.com\/([^/]+)\/([^/]+)/;
-  const match = url.match(githubRegex);
 
-  if (match && match.length === 3) {
-    const owner = match[1];
-    const repoName = match[2];
-    return { owner, repoName };
+// Function to extract the npm package name from an npm link
+function extractPackageNameFromNpmLink(npmLink: string): string | null {
+  const npmLinkRegex = /www\.npmjs\.com\/package\/([^/]+)/;
+  const match = npmLink.match(npmLinkRegex);
+
+  if (match && match.length === 2) {
+    return match[1];
   } else {
-    console.error('Invalid GitHub URL');
+    return null;
+  }
+}
+
+// Function to fetch GitHub repository information from an npm package name
+async function getGitHubRepoFromNpm(packageName: string): Promise<string | null> {
+  try {
+    const response = await axios.get(`https://registry.npmjs.org/${packageName}`);
+    const packageData = response.data;
+
+    if (packageData.repository && packageData.repository.url) {
+      // Extract the GitHub repository URL from the npm package data
+      const repositoryUrl = packageData.repository.url;
+      // Convert the npm-specific URL to a GitHub URL
+      const githubUrl = repositoryUrl.replace(/^git\+/, '').replace(/\.git$/, '');
+      return githubUrl;
+    }
+    return null;
+  } catch (error) {
     return null;
   }
 }
